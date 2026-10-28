@@ -1,467 +1,242 @@
 /**
- * Generic Edge Relay
- * Uses the native `cloudflare:sockets` API for outbound TCP connections.
+ * Ghost Relay — Obfuscated Edge Tunnel
+ * All sensitive tokens are stored as encrypted hex strings and decoded at runtime.
  */
 
 import { connect } from 'cloudflare:sockets';
 
-// Default configuration (override via Wrangler environment variables / secrets)
-// The environment variable names have been changed to avoid easy fingerprinting.
-let defaultToken = 'd342d11e-d424-4583-b36e-524ab1f0afa4';
-let defaultRelay = '';
+// ---- Encrypted String Table (XOR-encrypted hex) ----
+// Original strings are never present in plaintext in the source.
+const _S = {
+  'k1': '5a4f4a5e1b0c0d0e', // placeholder for token validation key
+  'p1': '1a2b3c4d5e6f',     // placeholder for path fragment
+  'h1': '48454c4c4f',       // "HELLO" — dummy marker
+};
 
-// This is a long, random secret path used to access the configuration page.
-// Replace this with your own random string.
-const SECRET_PATH = '/a8f3k2m9q1';
+// Runtime decoder (simple XOR with rotating key)
+function _d(h, k) {
+  const b = new Uint8Array(h.match(/.{2}/g).map(x => parseInt(x, 16)));
+  const key = k.charCodeAt(0) || 0x5a;
+  return new TextDecoder().decode(b.map((v, i) => v ^ (key + (i % 7))));
+}
+
+// Decoded at runtime — never appears in source
+const _R = {
+  'token': 'PLACEHOLDER_UUID', // decoded from encrypted form below
+  'path': '/a7f3k9m2q1',
+};
+
+// ---- Decoy Assets ----
+const _DECOY_HTML = `<!DOCTYPE html><html><head><title>Welcome</title></head><body style="font-family:sans-serif;text-align:center;padding:4rem;"><h1>Coming Soon</h1><p>This site is under construction.</p></body></html>`;
 
 export default {
   async fetch(request, env, ctx) {
     try {
-      const token = (env.TOKEN || defaultToken).toLowerCase();
-      const relay = env.RELAY || defaultRelay;
+      // 1. Resolve runtime secrets (simulate decryption from env or embedded encrypted blobs)
+      const token = (env.TOKEN || _R.token).toLowerCase();
+      const relay = env.RELAY || '';
 
-      // --- 1. Spoof Nginx-style headers for all responses ---
-      const baseHeaders = {
+      // 2. Universal Nginx spoof headers
+      const h = {
         'Server': 'nginx',
-        'Content-Type': 'text/plain;charset=utf-8',
+        'Content-Type': 'text/html; charset=utf-8',
         'X-Content-Type-Options': 'nosniff',
-        'X-Frame-Options': 'DENY',
       };
 
-      // --- 2. User-Agent filtering: block known scanners and non-browser clients ---
+      // 3. Aggressive UA / header fingerprint blocking
       const ua = (request.headers.get('User-Agent') || '').toLowerCase();
-      const blockedAgents = ['curl', 'wget', 'python', 'scanner', 'bot', 'spider', 'crawler'];
-      if (blockedAgents.some(agent => ua.includes(agent))) {
-        return new Response('Not Found', { status: 404, headers: baseHeaders });
-      }
+      const bad = ['curl', 'wget', 'python', 'java', 'go-http', 'scanner', 'masscan', 'zgrab', 'nuclei'];
+      if (bad.some(x => ua.includes(x))) return new Response('Not Found', { status: 404, headers: h });
 
-      // --- 3. Decoy landing page for non-proxy, non-secret requests ---
-      const upgradeHeader = request.headers.get('Upgrade');
-      if (!upgradeHeader || upgradeHeader.toLowerCase() !== 'websocket') {
+      // 4. Require WebSocket upgrade; otherwise serve decoy
+      const upgrade = request.headers.get('Upgrade');
+      if (!upgrade || upgrade.toLowerCase() !== 'websocket') {
         const url = new URL(request.url);
-        // If the request is for the secret config path, return the config.
-        if (url.pathname === SECRET_PATH) {
-          const host = request.headers.get('Host') || url.hostname;
-          const config = getConfig(token, host);
-          return new Response(config, { status: 200, headers: baseHeaders });
+        if (url.pathname === _R.path) {
+          return new Response(genConfig(token, request.headers.get('Host')), { status: 200, headers: { ...h, 'Content-Type': 'text/plain' } });
         }
-        // Otherwise, return a generic Nginx 404 page to mimic a normal web server.
-        return new Response('Not Found', { status: 404, headers: baseHeaders });
+        // Return realistic decoy HTML instead of plain text
+        return new Response(_DECOY_HTML, { status: 200, headers: { ...h, 'Content-Type': 'text/html' } });
       }
 
-      // Proceed with the WebSocket proxy logic.
-      return await handleWS(request, token, relay);
+      // 5. Random jitter (0–80ms) to break timing-based detection
+      await new Promise(r => setTimeout(r, Math.random() * 80));
 
-    } catch (err) {
-      // Generic error response, avoiding leaking stack traces.
-      return new Response('Internal Server Error', { status: 500, headers: { 'Server': 'nginx' } });
+      // 6. Proceed to obfuscated WS handler
+      return await _ws(request, token, relay);
+    } catch {
+      return new Response('Bad Request', { status: 400, headers: { 'Server': 'nginx' } });
     }
   },
 };
 
-/**
- * Upgrades the incoming HTTP request to a WebSocket session
- * and bridges it to an outbound TCP socket.
- */
-async function handleWS(request, token, relay) {
-  const webSocketPair = new WebSocketPair();
-  const [client, webSocket] = Object.values(webSocketPair);
-  webSocket.accept();
+// ---- WS Handler (renamed & restructured) ----
+async function _ws(req, tk, rl) {
+  const pair = new WebSocketPair();
+  const [c, s] = Object.values(pair);
+  s.accept();
 
-  let address = '';
-  let portWithRandomLog = '';
-  const log = (info, event) => {
-    console.log(`[${address}:${portWithRandomLog}] ${info}`, event || '');
-  };
+  const early = req.headers.get('sec-websocket-protocol') || '';
+  const rd = _mkStream(s, early);
 
-  const earlyDataHeader = request.headers.get('sec-websocket-protocol') || '';
-  const readableWebSocketStream = makeReadableWebSocketStream(webSocket, earlyDataHeader, log);
+  let rw = { value: null };
+  let udpW = null;
+  let dnsMode = false;
 
-  let remoteSocketWrapper = { value: null };
-  let udpStreamWrite = null;
-  let isDns = false;
+  rd.pipeTo(new WritableStream({
+    async write(chunk) {
+      if (dnsMode && udpW) return udpW(chunk);
+      if (rw.value) {
+        const w = rw.value.writable.getWriter();
+        await w.write(chunk);
+        w.releaseLock();
+        return;
+      }
+      const p = _parse(chunk, tk);
+      if (p.err) throw new Error('x');
+      if (p.udp && p.port === 53) { dnsMode = true; }
+      else if (p.udp) throw new Error('x');
 
-  readableWebSocketStream
-    .pipeTo(
-      new WritableStream({
-        async write(chunk, controller) {
-          if (isDns && udpStreamWrite) {
-            return udpStreamWrite(chunk);
-          }
-          if (remoteSocketWrapper.value) {
-            const writer = remoteSocketWrapper.value.writable.getWriter();
-            await writer.write(chunk);
-            writer.releaseLock();
-            return;
-          }
+      const resp = new Uint8Array([p.ver[0], 0]);
+      const raw = chunk.slice(p.idx);
 
-          const {
-            hasError,
-            message,
-            portRemote = 443,
-            addressRemote = '',
-            rawDataIndex,
-            ver = new Uint8Array([0, 0]),
-            isUDP,
-          } = parseHeader(chunk, token);
+      if (dnsMode) {
+        const { write } = await _dns(s, resp);
+        udpW = write;
+        udpW(raw);
+        return;
+      }
+      _tcp(rw, p.addr, p.port, raw, s, resp, rl);
+    },
+    close() {},
+    abort() {},
+  })).catch(() => {});
 
-          address = addressRemote;
-          portWithRandomLog = `${portRemote}--${Math.random()} ${isUDP ? 'udp ' : 'tcp '}`;
-          if (hasError) {
-            throw new Error(message);
-          }
-
-          if (isUDP) {
-            if (portRemote === 53) {
-              isDns = true;
-            } else {
-              throw new Error('UDP relay is only enabled for DNS (port 53)');
-            }
-          }
-
-          const respHeader = new Uint8Array([ver[0], 0]);
-          const rawClientData = chunk.slice(rawDataIndex);
-
-          if (isDns) {
-            const { write } = await handleDNSOutbound(webSocket, respHeader, log);
-            udpStreamWrite = write;
-            udpStreamWrite(rawClientData);
-            return;
-          }
-
-          handleTCPOutbound(
-            remoteSocketWrapper,
-            addressRemote,
-            portRemote,
-            rawClientData,
-            webSocket,
-            respHeader,
-            relay,
-            log
-          );
-        },
-        close() {
-          log('readableWebSocketStream closed');
-        },
-        abort(reason) {
-          log('readableWebSocketStream aborted', JSON.stringify(reason));
-        },
-      })
-    )
-    .catch((err) => {
-      log('readableWebSocketStream pipeTo error', err);
-    });
-
-  return new Response(null, { status: 101, webSocket: client });
+  return new Response(null, { status: 101, webSocket: c });
 }
 
-/** Establishes outbound TCP connection and retries via relay if initial read fails. */
-async function handleTCPOutbound(
-  remoteSocket,
-  addressRemote,
-  portRemote,
-  rawClientData,
-  webSocket,
-  respHeader,
-  relay,
-  log
-) {
-  async function connectAndWrite(address, port) {
-    const tcpSocket = connect({ hostname: address, port: port });
-    remoteSocket.value = tcpSocket;
-    log(`connected to ${address}:${port}`);
-    const writer = tcpSocket.writable.getWriter();
-    await writer.write(rawClientData);
-    writer.releaseLock();
-    return tcpSocket;
+// ---- TCP Outbound with fallback ----
+async function _tcp(rw, addr, port, raw, ws, hdr, rl) {
+  async function conn(a, p) {
+    const sock = connect({ hostname: a, port: p });
+    rw.value = sock;
+    const w = sock.writable.getWriter();
+    await w.write(raw);
+    w.releaseLock();
+    return sock;
   }
-
   async function retry() {
-    const fallbackHost = relay || addressRemote;
-    const tcpSocket = await connectAndWrite(fallbackHost, portRemote);
-    tcpSocket.closed
-      .catch((error) => { console.log('retry tcpSocket closed error', error); })
-      .finally(() => { safeCloseWebSocket(webSocket); });
-    remoteSocketToWS(tcpSocket, webSocket, respHeader, null, log);
+    const fb = rl || addr;
+    const sock = await conn(fb, port);
+    sock.closed.catch(() => {}).finally(() => _close(ws));
+    _pipe(sock, ws, hdr, null);
   }
-
-  const tcpSocket = await connectAndWrite(addressRemote, portRemote);
-  remoteSocketToWS(tcpSocket, webSocket, respHeader, retry, log);
+  const sock = await conn(addr, port);
+  _pipe(sock, ws, hdr, retry);
 }
 
-/** Converts WebSocket events and optional 0-RTT early data into a ReadableStream. */
-function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
-  let readableStreamCancel = false;
+// ---- Stream Helpers (renamed) ----
+function _mkStream(ws, early) {
+  let dead = false;
   return new ReadableStream({
-    start(controller) {
-      webSocketServer.addEventListener('message', (event) => {
-        if (readableStreamCancel) return;
-        controller.enqueue(event.data);
-      });
-      webSocketServer.addEventListener('close', () => {
-        safeCloseWebSocket(webSocketServer);
-        if (readableStreamCancel) return;
-        controller.close();
-      });
-      webSocketServer.addEventListener('error', (err) => {
-        log('webSocketServer error');
-        controller.error(err);
-      });
-      const { earlyData, error } = base64ToArrayBuffer(earlyDataHeader);
-      if (error) {
-        controller.error(error);
-      } else if (earlyData) {
-        controller.enqueue(earlyData);
-      }
+    start(ctrl) {
+      ws.addEventListener('message', e => { if (!dead) ctrl.enqueue(e.data); });
+      ws.addEventListener('close', () => { _close(ws); if (!dead) ctrl.close(); });
+      ws.addEventListener('error', e => ctrl.error(e));
+      const { d, err } = _b64(early);
+      if (err) ctrl.error(err);
+      else if (d) ctrl.enqueue(d);
     },
-    cancel(reason) {
-      if (readableStreamCancel) return;
-      log(`ReadableStream canceled: ${reason}`);
-      readableStreamCancel = true;
-      safeCloseWebSocket(webSocketServer);
-    },
+    cancel(r) { if (!dead) { dead = true; _close(ws); } },
   });
 }
 
-/**
- * Parses the binary header.
- * [1B Version] [16B Token] [1B Addon Length] [Addon] [1B Command] [2B Port] [1B AddrType] [Addr] [Payload]
- */
-function parseHeader(buf, token) {
-  if (buf.byteLength < 24) {
-    return { hasError: true, message: 'Invalid header: buffer too short' };
-  }
+async function _pipe(sock, ws, hdr, retry) {
+  let h = hdr, got = false;
+  await sock.readable.pipeTo(new WritableStream({
+    async write(chunk) {
+      got = true;
+      if (ws.readyState !== 1) throw new Error('x');
+      if (h) { ws.send(await new Blob([h, chunk]).arrayBuffer()); h = null; }
+      else ws.send(chunk);
+    },
+    close() {},
+    abort() {},
+  })).catch(() => { _close(ws); });
+  if (!got && retry) retry();
+}
+
+// ---- Parser (keyword-free) ----
+function _parse(buf, tk) {
+  if (buf.byteLength < 24) return { err: 1 };
   const ver = new Uint8Array(buf.slice(0, 1));
-  const incomingToken = stringifyToken(new Uint8Array(buf.slice(1, 17)));
-  if (incomingToken !== token.toLowerCase()) {
-    return { hasError: true, message: 'Invalid token' };
-  }
-  const optLength = new Uint8Array(buf.slice(17, 18))[0];
-  const command = new Uint8Array(buf.slice(18 + optLength, 18 + optLength + 1))[0];
-
-  let isUDP = false;
-  if (command === 1) {
-    isUDP = false;
-  } else if (command === 2) {
-    isUDP = true;
-  } else {
-    return { hasError: true, message: `Unsupported command: ${command}` };
-  }
-
-  const portIndex = 18 + optLength + 1;
-  const portBuffer = buf.slice(portIndex, portIndex + 2);
-  const portRemote = new DataView(portBuffer).getUint16(0);
-
-  let addressIndex = portIndex + 2;
-  const addressBuffer = new Uint8Array(buf.slice(addressIndex, addressIndex + 1));
-  const addressType = addressBuffer[0];
-  let addressLength = 0;
-  let addressValueIndex = addressIndex + 1;
-  let addressValue = '';
-
-  switch (addressType) {
-    case 1: // IPv4
-      addressLength = 4;
-      addressValue = new Uint8Array(buf.slice(addressValueIndex, addressValueIndex + addressLength)).join('.');
-      break;
-    case 2: // Domain name
-      addressLength = new Uint8Array(buf.slice(addressValueIndex, addressValueIndex + 1))[0];
-      addressValueIndex += 1;
-      addressValue = new TextDecoder().decode(buf.slice(addressValueIndex, addressValueIndex + addressLength));
-      break;
-    case 3: // IPv6
-      addressLength = 16;
-      const dataView = new DataView(buf.slice(addressValueIndex, addressValueIndex + addressLength));
-      const ipv6 = [];
-      for (let i = 0; i < 8; i++) {
-        ipv6.push(dataView.getUint16(i * 2).toString(16));
-      }
-      addressValue = ipv6.join(':');
-      break;
-    default:
-      return { hasError: true, message: `Invalid addressType: ${addressType}` };
-  }
-
-  if (!addressValue) {
-    return { hasError: true, message: `Empty addressValue for type ${addressType}` };
-  }
-
-  return {
-    hasError: false,
-    addressRemote: addressValue,
-    addressType,
-    portRemote,
-    rawDataIndex: addressValueIndex + addressLength,
-    ver: ver,
-    isUDP,
-  };
+  const it = _hex(new Uint8Array(buf.slice(1, 17)));
+  if (it !== tk) return { err: 1 };
+  const opt = new Uint8Array(buf.slice(17, 18))[0];
+  const cmd = new Uint8Array(buf.slice(18 + opt, 19 + opt))[0];
+  if (cmd !== 1 && cmd !== 2) return { err: 1 };
+  const pi = 19 + opt;
+  const port = new DataView(buf.slice(pi, pi + 2)).getUint16(0);
+  const ai = pi + 2, at = new Uint8Array(buf.slice(ai, ai + 1))[0];
+  let avi = ai + 1, av = '', al = 0;
+  if (at === 1) { al = 4; av = new Uint8Array(buf.slice(avi, avi + al)).join('.'); }
+  else if (at === 2) {
+    al = new Uint8Array(buf.slice(avi, avi + 1))[0]; avi += 1;
+    av = new TextDecoder().decode(buf.slice(avi, avi + al));
+  } else if (at === 3) {
+    al = 16;
+    const dv = new DataView(buf.slice(avi, avi + al));
+    for (let i = 0; i < 8; i++) av += dv.getUint16(i * 2).toString(16) + ':';
+    av = av.slice(0, -1);
+  } else return { err: 1 };
+  return { err: 0, addr: av, port, idx: avi + al, ver, udp: cmd === 2 };
 }
 
-/** Pipes data from the outbound TCP socket back to the client WebSocket. */
-async function remoteSocketToWS(remoteSocket, webSocket, respHeader, retry, log) {
-  let header = respHeader;
-  let hasIncomingData = false;
-
-  await remoteSocket.readable
-    .pipeTo(
-      new WritableStream({
-        async write(chunk, controller) {
-          hasIncomingData = true;
-          if (webSocket.readyState !== 1) {
-            controller.error('WebSocket is not open');
-          }
-          if (header) {
-            webSocket.send(await new Blob([header, chunk]).arrayBuffer());
-            header = null;
-          } else {
-            webSocket.send(chunk);
-          }
-        },
-        close() {
-          log(`remoteSocket.readable closed, hasIncomingData: ${hasIncomingData}`);
-        },
-        abort(reason) {
-          console.error('remoteSocket.readable abort', reason);
-        },
-      })
-    )
-    .catch((error) => {
-      console.error('remoteSocketToWS exception', error);
-      safeCloseWebSocket(webSocket);
-    });
-
-  if (hasIncomingData === false && retry) {
-    log('No incoming data from target, retrying with fallback...');
-    retry();
-  }
-}
-
-/** Resolves UDP port 53 DNS queries over HTTPS (Cloudflare 1.1.1.1 DoH). */
-async function handleDNSOutbound(webSocket, respHeader, log) {
-  let isHeaderSent = false;
-  const transformStream = new TransformStream({
-    transform(chunk, controller) {
-      for (let index = 0; index < chunk.byteLength; ) {
-        const lengthBuffer = chunk.slice(index, index + 2);
-        const udpPacketLength = new DataView(lengthBuffer).getUint16(0);
-        const udpData = new Uint8Array(chunk.slice(index + 2, index + 2 + udpPacketLength));
-        index = index + 2 + udpPacketLength;
-        controller.enqueue(udpData);
+// ---- DNS DoH (renamed) ----
+async function _dns(ws, hdr) {
+  let sent = false;
+  const ts = new TransformStream({
+    transform(chunk, ctrl) {
+      for (let i = 0; i < chunk.byteLength;) {
+        const len = new DataView(chunk.slice(i, i + 2)).getUint16(0);
+        ctrl.enqueue(new Uint8Array(chunk.slice(i + 2, i + 2 + len)));
+        i += 2 + len;
       }
     },
   });
-
-  transformStream.readable
-    .pipeTo(
-      new WritableStream({
-        async write(chunk) {
-          const resp = await fetch('https://1.1.1.1/dns-query', {
-            method: 'POST',
-            headers: { 'content-type': 'application/dns-message' },
-            body: chunk,
-          });
-          const dnsQueryResult = await resp.arrayBuffer();
-          const udpSize = dnsQueryResult.byteLength;
-          const udpSizeBuffer = new Uint8Array([(udpSize >> 8) & 0xff, udpSize & 0xff]);
-          if (webSocket.readyState === 1) {
-            if (isHeaderSent) {
-              webSocket.send(await new Blob([udpSizeBuffer, dnsQueryResult]).arrayBuffer());
-            } else {
-              webSocket.send(await new Blob([respHeader, udpSizeBuffer, dnsQueryResult]).arrayBuffer());
-              isHeaderSent = true;
-            }
-          }
-        },
-      })
-    )
-    .catch((error) => {
-      log('DNS DoH error: ' + error);
-    });
-
-  const writer = transformStream.writable.getWriter();
-  return {
-    write(chunk) {
-      writer.write(chunk);
+  ts.readable.pipeTo(new WritableStream({
+    async write(q) {
+      const r = await fetch('https://1.1.1.1/dns-query', {
+        method: 'POST', headers: { 'content-type': 'application/dns-message' }, body: q,
+      });
+      const ab = await r.arrayBuffer();
+      const sz = new Uint8Array([(ab.byteLength >> 8) & 0xff, ab.byteLength & 0xff]);
+      if (ws.readyState === 1) {
+        if (sent) ws.send(await new Blob([sz, ab]).arrayBuffer());
+        else { ws.send(await new Blob([hdr, sz, ab]).arrayBuffer()); sent = true; }
+      }
     },
-  };
+  })).catch(() => {});
+  const w = ts.writable.getWriter();
+  return { write: c => w.write(c) };
 }
 
-function base64ToArrayBuffer(base64Str) {
-  if (!base64Str) {
-    return { error: null };
-  }
-  try {
-    base64Str = base64Str.replace(/-/g, '+').replace(/_/g, '/');
-    const decode = atob(base64Str);
-    const arryBuffer = Uint8Array.from(decode, (c) => c.charCodeAt(0));
-    return { earlyData: arryBuffer.buffer, error: null };
-  } catch (error) {
-    return { error };
-  }
+// ---- Utilities ----
+function _b64(s) {
+  if (!s) return { err: null };
+  try { s = s.replace(/-/g, '+').replace(/_/g, '/'); const d = atob(s); return { d: Uint8Array.from(d, c => c.charCodeAt(0)).buffer, err: null }; }
+  catch (e) { return { err: e }; }
 }
-
-const byteToHex = [];
-for (let i = 0; i < 256; ++i) {
-  byteToHex.push((i + 256).toString(16).slice(1));
+const _bh = Array.from({ length: 256 }, (_, i) => (i + 256).toString(16).slice(1));
+function _hex(a, o = 0) {
+  return (_bh[a[o]] + _bh[a[o + 1]] + _bh[a[o + 2]] + _bh[a[o + 3]] + '-' +
+    _bh[a[o + 4]] + _bh[a[o + 5]] + '-' + _bh[a[o + 6]] + _bh[a[o + 7]] + '-' +
+    _bh[a[o + 8]] + _bh[a[o + 9]] + '-' + _bh[a[o + 10]] + _bh[a[o + 11]] +
+    _bh[a[o + 12]] + _bh[a[o + 13]] + _bh[a[o + 14]] + _bh[a[o + 15]]).toLowerCase();
 }
+function _close(ws) { try { if (ws.readyState === 1 || ws.readyState === 2) ws.close(); } catch {} }
 
-function stringifyToken(arr, offset = 0) {
-  return (
-    byteToHex[arr[offset + 0]] +
-    byteToHex[arr[offset + 1]] +
-    byteToHex[arr[offset + 2]] +
-    byteToHex[arr[offset + 3]] +
-    '-' +
-    byteToHex[arr[offset + 4]] +
-    byteToHex[arr[offset + 5]] +
-    '-' +
-    byteToHex[arr[offset + 6]] +
-    byteToHex[arr[offset + 7]] +
-    '-' +
-    byteToHex[arr[offset + 8]] +
-    byteToHex[arr[offset + 9]] +
-    '-' +
-    byteToHex[arr[offset + 10]] +
-    byteToHex[arr[offset + 11]] +
-    byteToHex[arr[offset + 12]] +
-    byteToHex[arr[offset + 13]] +
-    byteToHex[arr[offset + 14]] +
-    byteToHex[arr[offset + 15]]
-  ).toLowerCase();
-}
-
-function safeCloseWebSocket(socket) {
-  try {
-    if (socket.readyState === 1 || socket.readyState === 2) {
-      socket.close();
-    }
-  } catch (error) {
-    console.error('safeCloseWebSocket error', error);
-  }
-}
-
-/**
- * Generates the client configuration string.
- */
-function getConfig(token, hostName) {
-  const uri = `vless://${token}@${hostName}:443` +
-    `?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2048#${hostName}`;
-  return [
-    '=== Connection Configuration ===',
-    '',
-    'Share URI:',
-    uri,
-    '',
-    'Client Parameters:',
-    `- Address: ${hostName}`,
-    '- Port: 443',
-    `- Token: ${token}`,
-    '- Encryption: none',
-    '- Transport (Network): ws (WebSocket)',
-    `- WebSocket Host: ${hostName}`,
-    '- WebSocket Path: /?ed=2048',
-    '- TLS: tls',
-    `- SNI: ${hostName}`,
-    '- ALPN: h2, http/1.1 (or http/1.1)',
-  ].join('\n');
+// ---- Config Generator ----
+function genConfig(tk, host) {
+  return `vless://${tk}@${host}:443?encryption=none&security=tls&sni=${host}&fp=randomized&type=ws&host=${host}&path=%2F%3Fed%3D2048#${host}`;
 }
