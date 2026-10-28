@@ -1,49 +1,69 @@
 /**
- * VLESS over WebSocket (WS + TLS 443) Cloudflare Worker
+ * Generic Edge Relay
  * Uses the native `cloudflare:sockets` API for outbound TCP connections.
  */
 
 import { connect } from 'cloudflare:sockets';
 
 // Default configuration (override via Wrangler environment variables / secrets)
-let defaultUUID = 'd342d11e-d424-4583-b36e-524ab1f0afa4';
-let defaultProxyIP = '';
+// The environment variable names have been changed to avoid easy fingerprinting.
+let defaultToken = 'd342d11e-d424-4583-b36e-524ab1f0afa4';
+let defaultRelay = '';
+
+// This is a long, random secret path used to access the configuration page.
+// Replace this with your own random string.
+const SECRET_PATH = '/a8f3k2m9q1';
 
 export default {
   async fetch(request, env, ctx) {
     try {
-      const userID = (env.UUID || defaultUUID).toLowerCase();
-      const proxyIP = env.PROXYIP || defaultProxyIP;
-      const upgradeHeader = request.headers.get('Upgrade');
+      const token = (env.TOKEN || defaultToken).toLowerCase();
+      const relay = env.RELAY || defaultRelay;
 
-      if (!upgradeHeader || upgradeHeader.toLowerCase() !== 'websocket') {
-        const url = new URL(request.url);
-        if (url.pathname === `/${userID}`) {
-          const host = request.headers.get('Host') || url.hostname;
-          const vlessConfig = getVLESSConfig(userID, host);
-          return new Response(vlessConfig, {
-            status: 200,
-            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-          });
-        }
-        return new Response('VLESS Cloudflare Worker Node is active.', {
-          status: 200,
-          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        });
+      // --- 1. Spoof Nginx-style headers for all responses ---
+      const baseHeaders = {
+        'Server': 'nginx',
+        'Content-Type': 'text/plain;charset=utf-8',
+        'X-Content-Type-Options': 'nosniff',
+        'X-Frame-Options': 'DENY',
+      };
+
+      // --- 2. User-Agent filtering: block known scanners and non-browser clients ---
+      const ua = (request.headers.get('User-Agent') || '').toLowerCase();
+      const blockedAgents = ['curl', 'wget', 'python', 'scanner', 'bot', 'spider', 'crawler'];
+      if (blockedAgents.some(agent => ua.includes(agent))) {
+        return new Response('Not Found', { status: 404, headers: baseHeaders });
       }
 
-      return await handleVLESSWebSocket(request, userID, proxyIP);
+      // --- 3. Decoy landing page for non-proxy, non-secret requests ---
+      const upgradeHeader = request.headers.get('Upgrade');
+      if (!upgradeHeader || upgradeHeader.toLowerCase() !== 'websocket') {
+        const url = new URL(request.url);
+        // If the request is for the secret config path, return the config.
+        if (url.pathname === SECRET_PATH) {
+          const host = request.headers.get('Host') || url.hostname;
+          const config = getConfig(token, host);
+          return new Response(config, { status: 200, headers: baseHeaders });
+        }
+        // Otherwise, return a generic Nginx 404 page to mimic a normal web server.
+        return new Response('Not Found', { status: 404, headers: baseHeaders });
+      }
+
+      // Proceed with the WebSocket proxy logic.
+      return await handleWS(request, token, relay);
+
     } catch (err) {
-      return new Response(err.toString(), { status: 500 });
+      // Generic error response, avoiding leaking stack traces.
+      return new Response('Internal Server Error', { status: 500, headers: { 'Server': 'nginx' } });
     }
   },
 };
 
 /**
- * Upgrades the incoming HTTP request to a WebSocket session and bridges it
- * to an outbound TCP socket using the VLESS wire protocol.
+ * Upgrades the incoming HTTP request to a WebSocket session
+ * and bridges it to an outbound TCP socket.
  */
-async function handleVLESSWebSocket(request, userID, proxyIP) {
+async function handleWS(request, token, relay) {
   const webSocketPair = new WebSocketPair();
   const [client, webSocket] = Object.values(webSocketPair);
   webSocket.accept();
@@ -81,13 +101,12 @@ async function handleVLESSWebSocket(request, userID, proxyIP) {
             portRemote = 443,
             addressRemote = '',
             rawDataIndex,
-            vlessVersion = new Uint8Array([0, 0]),
+            ver = new Uint8Array([0, 0]),
             isUDP,
-          } = processVLESSHeader(chunk, userID);
+          } = parseHeader(chunk, token);
 
           address = addressRemote;
           portWithRandomLog = `${portRemote}--${Math.random()} ${isUDP ? 'udp ' : 'tcp '}`;
-
           if (hasError) {
             throw new Error(message);
           }
@@ -96,15 +115,15 @@ async function handleVLESSWebSocket(request, userID, proxyIP) {
             if (portRemote === 53) {
               isDns = true;
             } else {
-              throw new Error('UDP proxy is only enabled for DNS (port 53)');
+              throw new Error('UDP relay is only enabled for DNS (port 53)');
             }
           }
 
-          const vlessResponseHeader = new Uint8Array([vlessVersion[0], 0]);
+          const respHeader = new Uint8Array([ver[0], 0]);
           const rawClientData = chunk.slice(rawDataIndex);
 
           if (isDns) {
-            const { write } = await handleDNSOutbound(webSocket, vlessResponseHeader, log);
+            const { write } = await handleDNSOutbound(webSocket, respHeader, log);
             udpStreamWrite = write;
             udpStreamWrite(rawClientData);
             return;
@@ -116,8 +135,8 @@ async function handleVLESSWebSocket(request, userID, proxyIP) {
             portRemote,
             rawClientData,
             webSocket,
-            vlessResponseHeader,
-            proxyIP,
+            respHeader,
+            relay,
             log
           );
         },
@@ -133,30 +152,22 @@ async function handleVLESSWebSocket(request, userID, proxyIP) {
       log('readableWebSocketStream pipeTo error', err);
     });
 
-  return new Response(null, {
-    status: 101,
-    webSocket: client,
-  });
+  return new Response(null, { status: 101, webSocket: client });
 }
 
-/**
- * Establishes outbound TCP connection and retries via proxyIP if initial read fails.
- */
+/** Establishes outbound TCP connection and retries via relay if initial read fails. */
 async function handleTCPOutbound(
   remoteSocket,
   addressRemote,
   portRemote,
   rawClientData,
   webSocket,
-  vlessResponseHeader,
-  proxyIP,
+  respHeader,
+  relay,
   log
 ) {
   async function connectAndWrite(address, port) {
-    const tcpSocket = connect({
-      hostname: address,
-      port: port,
-    });
+    const tcpSocket = connect({ hostname: address, port: port });
     remoteSocket.value = tcpSocket;
     log(`connected to ${address}:${port}`);
     const writer = tcpSocket.writable.getWriter();
@@ -166,25 +177,19 @@ async function handleTCPOutbound(
   }
 
   async function retry() {
-    const fallbackHost = proxyIP || addressRemote;
+    const fallbackHost = relay || addressRemote;
     const tcpSocket = await connectAndWrite(fallbackHost, portRemote);
     tcpSocket.closed
-      .catch((error) => {
-        console.log('retry tcpSocket closed error', error);
-      })
-      .finally(() => {
-        safeCloseWebSocket(webSocket);
-      });
-    remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, null, log);
+      .catch((error) => { console.log('retry tcpSocket closed error', error); })
+      .finally(() => { safeCloseWebSocket(webSocket); });
+    remoteSocketToWS(tcpSocket, webSocket, respHeader, null, log);
   }
 
   const tcpSocket = await connectAndWrite(addressRemote, portRemote);
-  remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, retry, log);
+  remoteSocketToWS(tcpSocket, webSocket, respHeader, retry, log);
 }
 
-/**
- * Converts WebSocket events and optional 0-RTT early data into a ReadableStream.
- */
+/** Converts WebSocket events and optional 0-RTT early data into a ReadableStream. */
 function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
   let readableStreamCancel = false;
   return new ReadableStream({
@@ -219,23 +224,20 @@ function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
 }
 
 /**
- * Parses the VLESS binary header:
- * [1B Version] [16B UUID] [1B Addon Length] [Addon] [1B Command] [2B Port] [1B AddrType] [Addr] [Payload]
+ * Parses the binary header.
+ * [1B Version] [16B Token] [1B Addon Length] [Addon] [1B Command] [2B Port] [1B AddrType] [Addr] [Payload]
  */
-function processVLESSHeader(vlessBuffer, userID) {
-  if (vlessBuffer.byteLength < 24) {
-    return { hasError: true, message: 'Invalid VLESS header: buffer too short' };
+function parseHeader(buf, token) {
+  if (buf.byteLength < 24) {
+    return { hasError: true, message: 'Invalid header: buffer too short' };
   }
-
-  const version = new Uint8Array(vlessBuffer.slice(0, 1));
-  const incomingUUID = stringifyUUID(new Uint8Array(vlessBuffer.slice(1, 17)));
-
-  if (incomingUUID !== userID.toLowerCase()) {
-    return { hasError: true, message: 'Invalid VLESS user UUID' };
+  const ver = new Uint8Array(buf.slice(0, 1));
+  const incomingToken = stringifyToken(new Uint8Array(buf.slice(1, 17)));
+  if (incomingToken !== token.toLowerCase()) {
+    return { hasError: true, message: 'Invalid token' };
   }
-
-  const optLength = new Uint8Array(vlessBuffer.slice(17, 18))[0];
-  const command = new Uint8Array(vlessBuffer.slice(18 + optLength, 18 + optLength + 1))[0];
+  const optLength = new Uint8Array(buf.slice(17, 18))[0];
+  const command = new Uint8Array(buf.slice(18 + optLength, 18 + optLength + 1))[0];
 
   let isUDP = false;
   if (command === 1) {
@@ -243,15 +245,15 @@ function processVLESSHeader(vlessBuffer, userID) {
   } else if (command === 2) {
     isUDP = true;
   } else {
-    return { hasError: true, message: `Unsupported VLESS command: ${command}` };
+    return { hasError: true, message: `Unsupported command: ${command}` };
   }
 
   const portIndex = 18 + optLength + 1;
-  const portBuffer = vlessBuffer.slice(portIndex, portIndex + 2);
+  const portBuffer = buf.slice(portIndex, portIndex + 2);
   const portRemote = new DataView(portBuffer).getUint16(0);
 
   let addressIndex = portIndex + 2;
-  const addressBuffer = new Uint8Array(vlessBuffer.slice(addressIndex, addressIndex + 1));
+  const addressBuffer = new Uint8Array(buf.slice(addressIndex, addressIndex + 1));
   const addressType = addressBuffer[0];
   let addressLength = 0;
   let addressValueIndex = addressIndex + 1;
@@ -260,24 +262,16 @@ function processVLESSHeader(vlessBuffer, userID) {
   switch (addressType) {
     case 1: // IPv4
       addressLength = 4;
-      addressValue = new Uint8Array(
-        vlessBuffer.slice(addressValueIndex, addressValueIndex + addressLength)
-      ).join('.');
+      addressValue = new Uint8Array(buf.slice(addressValueIndex, addressValueIndex + addressLength)).join('.');
       break;
     case 2: // Domain name
-      addressLength = new Uint8Array(
-        vlessBuffer.slice(addressValueIndex, addressValueIndex + 1)
-      )[0];
+      addressLength = new Uint8Array(buf.slice(addressValueIndex, addressValueIndex + 1))[0];
       addressValueIndex += 1;
-      addressValue = new TextDecoder().decode(
-        vlessBuffer.slice(addressValueIndex, addressValueIndex + addressLength)
-      );
+      addressValue = new TextDecoder().decode(buf.slice(addressValueIndex, addressValueIndex + addressLength));
       break;
     case 3: // IPv6
       addressLength = 16;
-      const dataView = new DataView(
-        vlessBuffer.slice(addressValueIndex, addressValueIndex + addressLength)
-      );
+      const dataView = new DataView(buf.slice(addressValueIndex, addressValueIndex + addressLength));
       const ipv6 = [];
       for (let i = 0; i < 8; i++) {
         ipv6.push(dataView.getUint16(i * 2).toString(16));
@@ -298,16 +292,14 @@ function processVLESSHeader(vlessBuffer, userID) {
     addressType,
     portRemote,
     rawDataIndex: addressValueIndex + addressLength,
-    vlessVersion: version,
+    ver: ver,
     isUDP,
   };
 }
 
-/**
- * Pipes data from the outbound TCP socket back to the client WebSocket.
- */
-async function remoteSocketToWS(remoteSocket, webSocket, vlessResponseHeader, retry, log) {
-  let vlessHeader = vlessResponseHeader;
+/** Pipes data from the outbound TCP socket back to the client WebSocket. */
+async function remoteSocketToWS(remoteSocket, webSocket, respHeader, retry, log) {
+  let header = respHeader;
   let hasIncomingData = false;
 
   await remoteSocket.readable
@@ -318,9 +310,9 @@ async function remoteSocketToWS(remoteSocket, webSocket, vlessResponseHeader, re
           if (webSocket.readyState !== 1) {
             controller.error('WebSocket is not open');
           }
-          if (vlessHeader) {
-            webSocket.send(await new Blob([vlessHeader, chunk]).arrayBuffer());
-            vlessHeader = null;
+          if (header) {
+            webSocket.send(await new Blob([header, chunk]).arrayBuffer());
+            header = null;
           } else {
             webSocket.send(chunk);
           }
@@ -344,11 +336,9 @@ async function remoteSocketToWS(remoteSocket, webSocket, vlessResponseHeader, re
   }
 }
 
-/**
- * Resolves UDP port 53 DNS queries over HTTPS (Cloudflare 1.1.1.1 DoH).
- */
-async function handleDNSOutbound(webSocket, vlessResponseHeader, log) {
-  let isVlessHeaderSent = false;
+/** Resolves UDP port 53 DNS queries over HTTPS (Cloudflare 1.1.1.1 DoH). */
+async function handleDNSOutbound(webSocket, respHeader, log) {
+  let isHeaderSent = false;
   const transformStream = new TransformStream({
     transform(chunk, controller) {
       for (let index = 0; index < chunk.byteLength; ) {
@@ -373,15 +363,12 @@ async function handleDNSOutbound(webSocket, vlessResponseHeader, log) {
           const dnsQueryResult = await resp.arrayBuffer();
           const udpSize = dnsQueryResult.byteLength;
           const udpSizeBuffer = new Uint8Array([(udpSize >> 8) & 0xff, udpSize & 0xff]);
-
           if (webSocket.readyState === 1) {
-            if (isVlessHeaderSent) {
+            if (isHeaderSent) {
               webSocket.send(await new Blob([udpSizeBuffer, dnsQueryResult]).arrayBuffer());
             } else {
-              webSocket.send(
-                await new Blob([vlessResponseHeader, udpSizeBuffer, dnsQueryResult]).arrayBuffer()
-              );
-              isVlessHeaderSent = true;
+              webSocket.send(await new Blob([respHeader, udpSizeBuffer, dnsQueryResult]).arrayBuffer());
+              isHeaderSent = true;
             }
           }
         },
@@ -418,7 +405,7 @@ for (let i = 0; i < 256; ++i) {
   byteToHex.push((i + 256).toString(16).slice(1));
 }
 
-function stringifyUUID(arr, offset = 0) {
+function stringifyToken(arr, offset = 0) {
   return (
     byteToHex[arr[offset + 0]] +
     byteToHex[arr[offset + 1]] +
@@ -454,23 +441,21 @@ function safeCloseWebSocket(socket) {
 }
 
 /**
- * Generates standard VLESS WS+TLS 443 URI and client configuration snippet.
+ * Generates the client configuration string.
  */
-function getVLESSConfig(userID, hostName) {
-  const vlessMain =
-    `vless://${userID}@${hostName}:443` +
+function getConfig(token, hostName) {
+  const uri = `vless://${token}@${hostName}:443` +
     `?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2048#${hostName}`;
-
   return [
-    '=== VLESS WS + TLS (Port 443) Node Configuration ===',
+    '=== Connection Configuration ===',
     '',
     'Share URI:',
-    vlessMain,
+    uri,
     '',
     'Client Parameters:',
     `- Address: ${hostName}`,
     '- Port: 443',
-    `- UUID: ${userID}`,
+    `- Token: ${token}`,
     '- Encryption: none',
     '- Transport (Network): ws (WebSocket)',
     `- WebSocket Host: ${hostName}`,
