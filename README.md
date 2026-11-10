@@ -1,56 +1,77 @@
-VLESS Cloudflare Worker Node (WS + TLS 443)
-A lightweight, serverless VLESS over WebSocket + TLS (Port 443) node designed to run on Cloudflare Workers using the native ⁠cloudflare:sockets⁠ TCP outbound API.
-Architecture Comparison: ⁠cloudflared⁠ vs. VLESS Worker
-Feature
-cloudflared (Cloudflare Tunnel)
-VLESS Cloudflare Worker (worker.js)
-Execution Environment
-Self-hosted daemon on your own server/machine
-Serverless JavaScript V8 isolate on Cloudflare's edge
-Primary Direction
-Inbound reverse tunnel (exposes local services to Cloudflare) or Zero Trust WARP
-Outbound proxy tunnel (accepts VLESS over WebSocket on port 443 and opens outbound TCP sockets via cloudflare:sockets)
-Transport & Security
-QUIC / HTTP/2 tunnel to Cloudflare edge
-WebSocket (ws) encapsulated in Cloudflare Edge TLS on port 443
-UDP Support
-Full UDP via WARP / QUIC
-TCP outbound + DNS-over-HTTPS (UDP port 53)
+# Edge Sync Worker
 
-Repository Structure
-￼ ⁠worker.js⁠ — Complete ES Module Cloudflare Worker implementing VLESS header parsing, WebSocket 0-RTT early data (⁠/?ed=2048⁠), TCP socket bridging via ⁠cloudflare:sockets⁠, and DoH DNS resolution.
-￼ ⁠wrangler.toml⁠ — Cloudflare Wrangler configuration file for one-command CLI or GitHub Actions deployment.
-￼ ⁠README.md⁠ — Setup, deployment, and client configuration guide.
-Quick Start & Deployment
-Method 1: Deploy with Wrangler CLI (Recommended for GitHub Repos)
-Method 2: Deploy via Cloudflare Dashboard
-1. Log in to the Cloudflare Dashboard and navigate to Workers & Pages -> Create Worker.
-2. Paste the contents of ⁠worker.js⁠ into the online editor and click Deploy.
-3. Go to Settings -> Variables and Secrets and add:
-￼ ⁠UUID⁠: Your generated UUID v4 string.
-￼ ⁠PROXYIP⁠ (optional): A fallback IP or hostname for Cloudflare-hosted targets.
-4. (Recommended) Under Settings -> Domains & Routes, attach a Custom Domain so TLS certificates and port ⁠443⁠ routing are automatically provisioned on your domain.
-Client Connection Details (WS + TLS 443)
-Once deployed, visit ⁠https://<your-worker-domain>/<your-uuid>⁠ in a browser to retrieve your ready-to-import ⁠vless://⁠ URI, or configure your VLESS client (v2rayN, Nekoray, Streisand, v2rayNG, Sing-box, or Clash Meta/Mihomo) with:
-Parameter
-Value
-Protocol
-VLESS
-Address / Server
-your-custom-domain.com (or any clean Cloudflare edge IP)
-Port
-443
-UUID
-Your configured UUID
-Encryption
-none
-Transport (Network)
-ws (WebSocket)
-WebSocket Host
-your-custom-domain.com
-WebSocket Path
-/?ed=2048
-TLS
-tls (Enabled)
-SNI
-your-custom-domain.com
+A single-file Cloudflare Worker that accepts VLESS connections over
+WebSocket + TLS on port 443 and forwards them over outbound TCP sockets
+(`cloudflare:sockets`). UDP is limited to DNS (port 53), answered via
+DNS-over-HTTPS. No server, no VPS — the Worker *is* the node.
+
+```
+client ──VLESS / WS / TLS :443──▶ Cloudflare edge (this Worker) ──TCP──▶ internet
+```
+
+## Why it's built the way it is
+
+- **Secrets from the environment only.** There is no default UUID and no
+  hard-coded path in the source. An unset `UUID` makes the Worker serve
+  only the status page.
+- **The status page is the site.** Every non-WebSocket request gets a
+  small, boring status page. Nothing else is exposed.
+- **The client link lives behind the credential.** Visiting
+  `https://<your-host>/<uuid>` returns that user's ready-to-copy
+  `vless://` URI. Anyone without the UUID gets the status page —
+  unlike setups with a fixed public "config path", which leak the UUID
+  to anyone who reads the (often public) source.
+- **No fingerprint tricks.** No fake headers, user-agent blocking or
+  timing jitter: none of that is visible to anyone who matters, and
+  some of it breaks real clients. What keeps an account in good
+  standing is behaviour — personal-scale usage, your own domain, and
+  not publishing working links — not source-code cosmetics.
+- **Keep this repository private**, whatever you name it.
+
+## Deploy
+
+### Option A — Cloudflare dashboard (no tooling)
+
+1. Workers & Pages → **Create Worker**, give it an innocuous name.
+2. Replace the generated code with `worker.js`, Deploy.
+3. Settings → **Variables and Secrets** → add a *Secret*:
+   - `UUID` — a UUID v4 you generate (any "UUID generator"; keep it private)
+4. Settings → **Domains & Routes** → add a **Custom Domain** on a domain
+   you own (recommended over `workers.dev`: it routes on 443 with a real
+   certificate and doesn't advertise that it's a Worker).
+
+### Option B — Wrangler
+
+```bash
+npx wrangler login
+npx wrangler secret put UUID     # paste your UUID when prompted
+npx wrangler deploy
+```
+
+`wrangler.toml` is already in the repo; rename the worker there first.
+
+### Optional variables
+
+| Name      | Required | Purpose                                                     |
+| --------- | -------- | ----------------------------------------------------------- |
+| `UUID`    | yes      | User UUID(s), comma-separated for multiple users            |
+| `PROXYIP` | no       | Fallback relay host for destinations hosted on Cloudflare itself (the edge refuses direct connections to its own IPs) |
+| `DOH`     | no       | DNS-over-HTTPS endpoint for UDP/53 (default: Cloudflare DoH) |
+
+## Client setup
+
+Visit `https://<your-host>/<uuid>` after deploying — it prints the full
+URI and every field. In short: address = your custom domain (or any
+Cloudflare edge IP / Cloudflare-fronted hostname), port **443**,
+transport **ws**, path `/?ed=2048`, TLS on, SNI/Host = your domain.
+
+## Limits & honesty
+
+- Free-plan Workers have daily request and CPU limits; a tunnel holds
+  long-lived WebSocket requests, so this suits personal use, not sharing.
+- Cloudflare can see and can act on accounts whose traffic patterns look
+  like a public proxy service. There is no code trick that changes that;
+  keep usage personal, don't publish live links, and rotate the UUID if
+  one ever leaks (change the secret, redeploy — old links die instantly).
+- Destinations hosted behind Cloudflare need `PROXYIP` set, because
+  Workers cannot open sockets to Cloudflare's own edge IPs directly.

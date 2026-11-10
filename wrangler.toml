@@ -1,0 +1,13 @@
+# Rename this to something innocuous of your own — the worker name is
+# visible in your Cloudflare dashboard and in the workers.dev subdomain
+# if you use one. A custom domain (recommended) hides it entirely.
+name = "edge-sync"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+workers_dev = true
+
+# Set secrets/variables in the dashboard (Settings → Variables and
+# Secrets) or with wrangler — never commit real values here.
+#   UUID     (required, secret)  your UUID v4; comma-separate for several
+#   PROXYIP  (optional)          fallback relay for Cloudflare-hosted sites
+#   DOH      (optional)          DNS-over-HTTPS endpoint for UDP/53
