@@ -1,0 +1,30 @@
+{
+  "name": "webapp",
+  "version": "1.0.0",
+  "description": "Single-file Cloudflare Worker: WebSocket transport on 443, outbound TCP relay via cloudflare:sockets, DNS (UDP/53) via encrypted resolvers. The Worker is the node — no VPS.",
+  "main": "worker.js",
+  "directories": {
+    "test": "test"
+  },
+  "scripts": {
+    "test": "node --test test/proto.test.mjs test/e2e.test.mjs",
+    "build": "node scripts/build.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/faresbazed/cloudflare-workers.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/faresbazed/cloudflare-workers/issues"
+  },
+  "homepage": "https://github.com/faresbazed/cloudflare-workers#readme",
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "javascript-obfuscator": "^5.10.0",
+    "wrangler": "^4.160.1"
+  },
+  "type": "module"
+}

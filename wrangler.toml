@@ -7,7 +7,7 @@ compatibility_date = "2025-01-01"
 workers_dev = true
 
 # Set secrets/variables in the dashboard (Settings → Variables and
-# Secrets) or with wrangler — never commit real values here.
-#   UUID     (required, secret)  your UUID v4; comma-separate for several
-#   PROXYIP  (optional)          fallback relay for Cloudflare-hosted sites
-#   DOH      (optional)          DNS-over-HTTPS endpoint for UDP/53
+# Secrets) or with wrangler — never commit real values here:
+#   K  (required, secret)  accepted id(s) (UUID v4), comma-separated
+#   R  (optional)          fallback relay host for edge-hosted destinations
+#   N  (optional)          DNS-over-HTTPS endpoint for UDP/53
